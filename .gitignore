@@ -1,0 +1,65 @@
+# Python
+venv/
+.venv/
+env/
+.Python
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.o
+*.obj
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+*.whl
+
+# Pytest cache
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data and outputs (large files, generated artifacts)
+outputs/
+outputs/**/*
+*.parquet
+*.npz
+*.csv
+data/
+data/**/*
+
+# CUDA / compiled kernels
+phase3_cuda/cuda_kernels.so
+
+# Virtualenv/pip local files
+pip-delete-this-directory.txt
+
+# Misc
+*.cache
+*.swp
