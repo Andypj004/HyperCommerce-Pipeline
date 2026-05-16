@@ -80,6 +80,14 @@ Proyecto de procesamiento por fases para un dataset de comportamiento e-commerce
 - Propósito: construir matriz de similitud entre usuarios y ejecutar clustering/segmentación en GPU para acelerar operaciones densas (si dispone de CUDA).
 - Requisitos opcionales: NVIDIA CUDA Toolkit, drivers compatibles, `numba`/`cupy`/`pycuda` o bindings personalizados según `phase3_cuda/gpu_compute.py`.
 
+**Análisis de Rendimiento**
+
+| Fase | Tiempo de ejecución | Modo |
+| --- | ---: | --- |
+| Fase 1 | 379.7 s | CPU / Dask |
+| Fase 2 | 3626.1 s | CPU / Multiprocessing |
+| Fase 3 | 2.9 s | GPU |
+
 ---
 
 **Fase 4 — Dashboard**
