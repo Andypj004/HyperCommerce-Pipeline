@@ -126,6 +126,108 @@ python pipeline_runner.py --phase 2
 python pipeline_runner.py --phase 3
 ```
 
+
+**Requisitos y ejecución (detallado)**
+
+1) **Requisitos mínimos**
+- Python 3.8 o superior.
+- Espacio en disco suficiente para los CSVs y Parquets (~x GB según los datos que descargues).
+
+2) **Crear y activar entorno Python**
+- En WSL / Linux / macOS:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+- En PowerShell (Windows):
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+3) **Ajustar `config.py`**
+- Abra `config.py` y confirme las rutas: `DATA_DIR`, `OUTPUT_DIR`, `CPU_WORKERS`, `CHUNK_SIZE`, y `GPU_ENABLED` (si existe). Modifique según su máquina.
+
+4) **Descargar el dataset (Kaggle)**
+- Colocar el token `kaggle.json` en `~/.kaggle/kaggle.json` y proteger permisos:
+
+```bash
+mkdir -p ~/.kaggle
+cp /ruta/a/kaggle.json ~/.kaggle/
+chmod 600 ~/.kaggle/kaggle.json
+```
+
+- El `pipeline_runner.py` intentará descargar automáticamente si los CSVs no están en `config.DATA_DIR`. Si desea descargar manualmente, use la URL indicada en el README.
+
+5) **Ejecutar fases del pipeline**
+- Ejecutar todas las fases:
+
+```bash
+python pipeline_runner.py
+```
+
+- Ejecutar una fase concreta:
+
+```bash
+python pipeline_runner.py --phase 1
+python pipeline_runner.py --phase 2
+python pipeline_runner.py --phase 3
+python pipeline_runner.py --phase 4
+```
+
+6) **Soporte GPU / CUDA (opcional)**
+- Comprobar presencia de GPU y drivers:
+
+```bash
+nvidia-smi
+```
+
+- Instalar NVIDIA driver y CUDA Toolkit compatibles.
+- Instalar paquetes Python GPU (ejemplo para CUDA 11.x):
+
+```bash
+pip install cupy-cuda11x
+```
+
+- Alternativa con conda (gestiona dependencias CUDA mejor):
+
+```bash
+conda create -n hpc python=3.10
+conda activate hpc
+conda install -c conda-forge cupy
+pip install -r requirements.txt
+```
+
+- Probar GPU desde Python:
+
+```bash
+python - <<'PY'
+import sys
+try:
+  import cupy as cp
+  print('GPU OK, cupy version:', cp.__version__)
+except Exception as e:
+  print('GPU test failed:', e, file=sys.stderr)
+PY
+```
+
+7) **Ejecutar el dashboard (Streamlit)**
+
+```bash
+streamlit run phase4_streamlit/dashboard.py
+```
+
+8) **Ajustes y debugging rápidos**
+- Cambiar `blocksize` en `phase1_dask_ingestion/ingest.py` si tiene más RAM.
+- Ajustar `config.CPU_WORKERS` y `CHUNK_SIZE` para la Fase 2 en `config.py`.
+- Problemas con PyArrow/Parquet: verificar versión con `python -c "import pyarrow; print(pyarrow.__version__)"` y ajustar si es necesario.
+- Mensajes sobre `Categorical` están resueltos en la ingesta (convierte a `object` y rellena `unknown`).
+
 Notas de ejecución:
 - Si no existen CSVs en `config.DATA_DIR`, el runner intenta descargar el dataset con `kagglehub`.
 - La Fase 1 usa `dask` en modo `synchronous` por defecto (para bajo uso de RAM). Cambiar `dask.config` puede paralelizar si hay RAM suficiente.
