@@ -28,21 +28,17 @@ Paralelismo:
   • Cada proceso es independiente (no comparte memoria) → sin GIL.
   • Los resultados parciales se reciben por cola y se concatenan al final.
 """
-
 import os
 import sys
 import time
+import glob
 import logging
 import warnings
-import glob
-from math import log2
-from typing import Any
+from multiprocessing import Pool, current_process
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import pyarrow as pa
-from multiprocessing import Pool, cpu_count, current_process
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import config
@@ -55,127 +51,182 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Columnas que cada worker necesita leer
+NEEDED_COLS = [
+    "user_id", "product_id", "price",
+    "category_top", "brand", "price_bucket",
+    "hour", "dow", "month",
+]
 
-# ── Función de trabajo (se ejecuta en cada proceso hijo) ─────────────────────
 
-def _compute_user_features(chunk_df: pd.DataFrame) -> pd.DataFrame:
+# ── Worker: procesa UN archivo Parquet completo ───────────────────────────────
+
+def _process_parquet_file(parquet_path: str) -> pd.DataFrame:
     """
-    Calcula ~10 features por usuario para todos los usuarios del chunk.
-    Esta función corre en un proceso hijo independiente.
+    Lee un archivo Parquet y calcula todas las features por usuario
+    usando EXCLUSIVAMENTE operaciones vectorizadas de pandas/numpy.
+
+    Sin loops Python → el cómputo ocurre en C/Cython internamente.
     """
     proc = current_process().name
 
-    records = []
-    for user_id, grp in chunk_df.groupby("user_id", sort=False):
-        n = len(grp)
+    # Leer solo columnas necesarias (proyección PyArrow → menos I/O y RAM)
+    table = pq.read_table(parquet_path, columns=NEEDED_COLS)
+    df    = table.to_pandas()
+    del table  # liberar memoria PyArrow inmediatamente
 
-        # ── Monetary ──────────────────────────────────────────────────────
-        total_spend   = grp["price"].sum()
-        avg_price     = grp["price"].mean()
-        std_price     = grp["price"].std() if n > 1 else 0.0
-        min_price     = grp["price"].min()
-        max_price     = grp["price"].max()
+    if df.empty:
+        return pd.DataFrame()
 
-        # ── Frequency ─────────────────────────────────────────────────────
-        frequency     = n
+    # Asegurar tipos correctos
+    df["price"]    = df["price"].astype(np.float32)
+    df["user_id"]  = df["user_id"].astype(np.int32)
+    df["hour"]     = df["hour"].astype(np.int8)
+    df["dow"]      = df["dow"].astype(np.int8)
+    df["month"]    = df["month"].astype(np.int8)
 
-        # ── Recency proxy (hora más reciente del dataset como referencia) ──
-        # (no tenemos fecha de referencia externa; usamos month como proxy)
-        last_month    = int(grp["month"].max())
-        first_month   = int(grp["month"].min())
-        span_months   = max(last_month - first_month, 1)
+    g = df.groupby("user_id", sort=False)
 
-        # ── Diversidad de categorías (entropía de Shannon) ─────────────────
-        cat_counts    = grp["category_top"].value_counts(normalize=True)
-        entropy_cat   = -sum(p * log2(p) for p in cat_counts if p > 0)
+    # ── 1. Métricas monetarias y de frecuencia (una sola pasada groupby) ───
+    price_agg = g["price"].agg(
+        frequency  = "count",
+        total_spend= "sum",
+        avg_price  = "mean",
+        std_price  = "std",
+        min_price  = "min",
+        max_price  = "max",
+    ).reset_index()
+    price_agg["std_price"] = price_agg["std_price"].fillna(0.0)
 
-        # ── Marca favorita y lealtad ───────────────────────────────────────
-        brand_counts  = grp["brand"].value_counts()
-        top_brand     = brand_counts.index[0] if len(brand_counts) > 0 else "unknown"
-        brand_loyalty = brand_counts.iloc[0] / n  # % compras a marca top
+    # ── 2. Recency proxy (span de meses) ────────────────────────────────────
+    month_agg = g["month"].agg(
+        last_month = "max",
+        first_month= "min",
+    ).reset_index()
+    month_agg["span_months"] = (
+        month_agg["last_month"] - month_agg["first_month"]
+    ).clip(lower=1)
 
-        # ── Hora de compra preferida ───────────────────────────────────────
-        peak_hour     = int(grp["hour"].mode().iloc[0]) if n > 0 else 0
+    # ── 3. Entropía de Shannon de categorías (vectorizado) ──────────────────
+    # Conteo de cada (user_id, category_top)
+    cat_counts = (
+        df.groupby(["user_id", "category_top"], sort=False)
+        .size()
+        .reset_index(name="cnt")
+    )
+    # Normalizar dentro de cada usuario
+    user_totals = cat_counts.groupby("user_id")["cnt"].transform("sum")
+    cat_counts["p"] = cat_counts["cnt"] / user_totals
+    # Entropía: -Σ p·log2(p)
+    cat_counts["h"] = -cat_counts["p"] * np.log2(cat_counts["p"].clip(lower=1e-10))
+    entropy_agg = (
+        cat_counts.groupby("user_id")["h"]
+        .sum()
+        .reset_index()
+        .rename(columns={"h": "entropy_cat"})
+    )
 
-        # ── Ratio fin de semana (dow 5=sab, 6=dom) ─────────────────────────
-        weekend_ratio = (grp["dow"] >= 5).mean()
+    # ── 4. Marca favorita y lealtad (vectorizado) ───────────────────────────
+    brand_counts = (
+        df.groupby(["user_id", "brand"], sort=False)
+        .size()
+        .reset_index(name="brand_cnt")
+    )
+    # Fila con máximo conteo por usuario (= marca favorita)
+    top_brand_idx = brand_counts.groupby("user_id")["brand_cnt"].idxmax()
+    top_brand_df  = brand_counts.loc[top_brand_idx, ["user_id", "brand", "brand_cnt"]].copy()
+    top_brand_df  = top_brand_df.rename(columns={"brand": "top_brand",
+                                                   "brand_cnt": "top_brand_cnt"})
+    # Lealtad = compras a marca top / total compras
+    top_brand_df  = top_brand_df.merge(
+        price_agg[["user_id", "frequency"]], on="user_id", how="left"
+    )
+    top_brand_df["brand_loyalty"] = (
+        top_brand_df["top_brand_cnt"] / top_brand_df["frequency"]
+    ).clip(0, 1)
+    top_brand_df = top_brand_df[["user_id", "top_brand", "brand_loyalty"]]
 
-        # ── Bucket de precio predominante ─────────────────────────────────
-        dominant_bucket = (
-            grp["price_bucket"].value_counts().index[0]
-            if "price_bucket" in grp.columns else "unknown"
-        )
+    # ── 5. Hora pico (moda vectorizada con value_counts) ────────────────────
+    hour_counts = (
+        df.groupby(["user_id", "hour"], sort=False)
+        .size()
+        .reset_index(name="h_cnt")
+    )
+    peak_hour_df = (
+        hour_counts.loc[hour_counts.groupby("user_id")["h_cnt"].idxmax(),
+                        ["user_id", "hour"]]
+        .rename(columns={"hour": "peak_hour"})
+    )
 
-        records.append({
-            "user_id":        user_id,
-            "frequency":      frequency,
-            "total_spend":    round(float(total_spend), 4),
-            "avg_price":      round(float(avg_price), 4),
-            "std_price":      round(float(std_price), 4),
-            "min_price":      round(float(min_price), 4),
-            "max_price":      round(float(max_price), 4),
-            "entropy_cat":    round(float(entropy_cat), 6),
-            "top_brand":      top_brand,
-            "brand_loyalty":  round(float(brand_loyalty), 4),
-            "peak_hour":      peak_hour,
-            "weekend_ratio":  round(float(weekend_ratio), 4),
-            "span_months":    span_months,
-            "last_month":     last_month,
-            "dominant_bucket":dominant_bucket,
-        })
+    # ── 6. Ratio fin de semana ───────────────────────────────────────────────
+    df["is_weekend"] = (df["dow"] >= 5).astype(np.float32)
+    weekend_agg = (
+        g["is_weekend"]
+        .mean()
+        .reset_index()
+        .rename(columns={"is_weekend": "weekend_ratio"})
+    )
 
-    result = pd.DataFrame(records)
-    log.debug("%s — procesó %d usuarios", proc, len(result))
+    # ── 7. Bucket de precio dominante ───────────────────────────────────────
+    bucket_counts = (
+        df.groupby(["user_id", "price_bucket"], sort=False)
+        .size()
+        .reset_index(name="b_cnt")
+    )
+    dominant_bucket_df = (
+        bucket_counts.loc[bucket_counts.groupby("user_id")["b_cnt"].idxmax(),
+                          ["user_id", "price_bucket"]]
+        .rename(columns={"price_bucket": "dominant_bucket"})
+    )
+
+    # ── Merge de todas las features ──────────────────────────────────────────
+    result = (
+        price_agg
+        .merge(month_agg[["user_id", "last_month", "span_months"]], on="user_id", how="left")
+        .merge(entropy_agg,       on="user_id", how="left")
+        .merge(top_brand_df,      on="user_id", how="left")
+        .merge(peak_hour_df,      on="user_id", how="left")
+        .merge(weekend_agg,       on="user_id", how="left")
+        .merge(dominant_bucket_df,on="user_id", how="left")
+    )
+
+    # Redondear floats
+    float_cols = ["total_spend","avg_price","std_price","min_price",
+                  "max_price","entropy_cat","brand_loyalty","weekend_ratio"]
+    result[float_cols] = result[float_cols].round(4)
+
+    log.info("%s — %s: %d usuarios procesados",
+             proc, os.path.basename(parquet_path), len(result))
     return result
 
 
-def _load_parquet_as_chunks() -> list[pd.DataFrame]:
+# ── Merge final: fusionar resultados de múltiples archivos ───────────────────
+
+def _merge_results(partial_dfs: list) -> pd.DataFrame:
     """
-    Lee el Parquet de la Fase 1 en chunks de CHUNK_SIZE filas.
-    Usa pyarrow directamente para proyección de columnas (solo lee lo necesario).
+    Concatena los DataFrames de todos los workers y resuelve duplicados
+    de user_id que aparecen en más de un archivo Parquet.
+    Usa operaciones pandas vectorizadas (sin lambdas por fila).
     """
-    NEEDED_COLS = [
-        "user_id", "product_id", "price",
-        "category_top", "brand", "price_bucket",
-        "hour", "dow", "month",
-    ]
+    combined = pd.concat([d for d in partial_dfs if not d.empty],
+                         ignore_index=True)
 
-    parquet_files = sorted(
-        glob.glob(os.path.join(config.PARQUET_DIR, "**", "*.parquet"), recursive=True)
-    )
-    if not parquet_files:
-        raise FileNotFoundError(f"No se encontraron archivos Parquet en {config.PARQUET_DIR}")
+    if combined.empty:
+        return combined
 
-    log.info("Particiones Parquet: %d", len(parquet_files))
+    # Usuarios que aparecen en un solo archivo: no necesitan merge
+    user_counts = combined["user_id"].value_counts()
+    single_mask = combined["user_id"].isin(user_counts[user_counts == 1].index)
+    single_df   = combined[single_mask].copy()
+    multi_df    = combined[~single_mask].copy()
 
-    # Leer todo en un solo DataFrame (el Parquet ya está comprimido y filtrado)
-    # pero en chunks para no saturar RAM
-    chunks = []
-    batch_rows = config.CHUNK_SIZE * config.CPU_WORKERS  # Lee N*W filas a la vez
+    if multi_df.empty:
+        return single_df.reset_index(drop=True)
 
-    for fpath in parquet_files:
-        table = pq.read_table(fpath, columns=NEEDED_COLS)
-        df    = table.to_pandas()
+    # Para usuarios duplicados: agg vectorizado
+    g = multi_df.groupby("user_id", sort=False)
 
-        # Dividir en sub-chunks del tamaño correcto
-        for start in range(0, len(df), batch_rows):
-            chunks.append(df.iloc[start:start + batch_rows].copy())
-
-        del table, df  # Liberar inmediatamente
-
-    log.info("Total de chunks a procesar: %d", len(chunks))
-    return chunks
-
-
-def _merge_chunk_results(partial_dfs: list[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Concatena resultados parciales y resuelve duplicados de user_id
-    (un usuario puede aparecer en varios chunks/particiones).
-    """
-    combined = pd.concat(partial_dfs, ignore_index=True)
-
-    # Agrupar de nuevo para fusionar usuarios duplicados entre chunks
-    agg = combined.groupby("user_id", as_index=False).agg(
+    numeric_agg = g.agg(
         frequency      = ("frequency",     "sum"),
         total_spend    = ("total_spend",   "sum"),
         avg_price      = ("avg_price",     "mean"),
@@ -183,47 +234,65 @@ def _merge_chunk_results(partial_dfs: list[pd.DataFrame]) -> pd.DataFrame:
         min_price      = ("min_price",     "min"),
         max_price      = ("max_price",     "max"),
         entropy_cat    = ("entropy_cat",   "mean"),
-        top_brand      = ("top_brand",     lambda x: x.mode().iloc[0]),
         brand_loyalty  = ("brand_loyalty", "mean"),
-        peak_hour      = ("peak_hour",     lambda x: x.mode().iloc[0]),
         weekend_ratio  = ("weekend_ratio", "mean"),
         span_months    = ("span_months",   "max"),
         last_month     = ("last_month",    "max"),
-        dominant_bucket= ("dominant_bucket",lambda x: x.mode().iloc[0]),
+        peak_hour      = ("peak_hour",     "first"),   # aproximación rápida
+    ).reset_index()
+
+    # top_brand y dominant_bucket: el del archivo con más frecuencia
+    top_brand_df = (
+        multi_df.loc[multi_df.groupby("user_id")["frequency"].idxmax(),
+                     ["user_id", "top_brand", "dominant_bucket"]]
     )
-    return agg
+    numeric_agg = numeric_agg.merge(top_brand_df, on="user_id", how="left")
+
+    merged = pd.concat([single_df, numeric_agg], ignore_index=True)
+    return merged.reset_index(drop=True)
 
 
-# ── Punto de entrada ─────────────────────────────────────────────────────────
+# ── Punto de entrada ──────────────────────────────────────────────────────────
 
 def run() -> pd.DataFrame:
-    """
-    Ejecuta la Fase 2 completa y devuelve el DataFrame de features por usuario.
-    """
     t0 = time.perf_counter()
-    log.info("Iniciando Fase 2 — %d workers CPU", config.CPU_WORKERS)
 
-    chunks = _load_parquet_as_chunks()
+    # Encontrar todos los archivos Parquet de la Fase 1
+    parquet_files = sorted(
+        glob.glob(os.path.join(config.PARQUET_DIR, "**", "*.parquet"),
+                  recursive=True)
+    )
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No se encontraron Parquets en {config.PARQUET_DIR}. "
+            "Ejecuta primero la Fase 1."
+        )
 
-    # Pool de procesos — cada proceso hijo recibe un chunk completo
+    log.info("Archivos Parquet: %d | Workers CPU: %d",
+             len(parquet_files), config.CPU_WORKERS)
+
+    # Distribuir archivos entre workers (uno por proceso)
+    # imap_unordered → el proceso principal recibe resultados
+    # en cuanto cada worker termina, sin esperar al más lento
     partial_results = []
     with Pool(processes=config.CPU_WORKERS) as pool:
-        for i, result in enumerate(pool.imap_unordered(_compute_user_features, chunks)):
+        for i, result in enumerate(
+            pool.imap_unordered(_process_parquet_file, parquet_files)
+        ):
             partial_results.append(result)
-            if (i + 1) % 5 == 0 or (i + 1) == len(chunks):
-                log.info("  Chunks completados: %d / %d", i + 1, len(chunks))
+            log.info("  Archivos completados: %d / %d", i + 1, len(parquet_files))
 
-    log.info("Fusionando resultados de %d chunks …", len(partial_results))
-    features_df = _merge_chunk_results(partial_results)
+    log.info("Fusionando resultados …")
+    features_df = _merge_results(partial_results)
 
-    log.info("Features extraídas para %d usuarios únicos", len(features_df))
+    log.info("Features extraídas: %d usuarios únicos", len(features_df))
+    log.info("  Columnas: %s", list(features_df.columns))
 
-    # Guardar en Parquet para Fase 3
     features_df.to_parquet(config.CPU_RESULT, index=False, compression="snappy")
-    log.info("Features guardadas en %s", config.CPU_RESULT)
+    log.info("Guardado en %s", config.CPU_RESULT)
 
     elapsed = time.perf_counter() - t0
-    log.info("FASE 2 completada en %.1f s", elapsed)
+    log.info("FASE 2 completada en %.1f s  (%.1f min)", elapsed, elapsed / 60)
     features_df.attrs["phase2_elapsed_s"] = round(elapsed, 2)
     return features_df
 
