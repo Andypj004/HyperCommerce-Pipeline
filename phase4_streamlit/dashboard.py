@@ -26,7 +26,6 @@ import sys
 import json
 import time
 import subprocess
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -48,414 +47,351 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Paleta de colores por segmento ───────────────────────────────────────────
 SEG_COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A"]
-SEG_NAMES  = [f"Segmento {i}" for i in range(5)]
+PIPELINE_LOG_FILE = os.path.join(config.OUTPUT_DIR, "pipeline_run.log")
+PIPELINE_PID_FILE = os.path.join(config.OUTPUT_DIR, "pipeline.pid")
 
 
-# ── Loaders con caché ────────────────────────────────────────────────────────
+# ── Helpers de pipeline ───────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300)
+def _pipeline_is_running() -> bool:
+    if not os.path.exists(PIPELINE_PID_FILE):
+        return False
+    try:
+        pid = int(open(PIPELINE_PID_FILE).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, OSError):
+        return False
+
+def _read_log_tail(n: int = 80) -> str:
+    if not os.path.exists(PIPELINE_LOG_FILE):
+        return "(sin log aún — el pipeline no ha sido lanzado)"
+    try:
+        lines = open(PIPELINE_LOG_FILE, "r", errors="replace").readlines()
+        return "".join(lines[-n:]) if lines else "(log vacío)"
+    except Exception as e:
+        return f"(error leyendo log: {e})"
+
+def _log_pct() -> int:
+    log = _read_log_tail(400)
+    if "PIPELINE COMPLETADO" in log: return 100
+    if "FASE 3 completada"   in log: return 90
+    if "FASE 3"              in log: return 65
+    if "FASE 2 completada"   in log: return 60
+    if "FASE 2"              in log: return 35
+    if "FASE 1 completada"   in log: return 30
+    if "FASE 1"              in log: return 10
+    return 3
+
+def _start_pipeline():
+    open(PIPELINE_LOG_FILE, "w").close()
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / "pipeline_runner.py")],
+        stdout=open(PIPELINE_LOG_FILE, "w"),
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+    )
+    open(PIPELINE_PID_FILE, "w").write(str(proc.pid))
+
+
+# ── Loaders sin caché ─────────────────────────────────────────────────────────
+
 def load_metrics() -> dict:
     if not os.path.exists(config.METRICS_FILE):
         return {}
-    with open(config.METRICS_FILE) as f:
-        return json.load(f)
+    try:
+        return json.load(open(config.METRICS_FILE))
+    except Exception:
+        return {}
 
-
-@st.cache_data(ttl=300)
 def load_user_features() -> pd.DataFrame:
     if not os.path.exists(config.CPU_RESULT):
         return pd.DataFrame()
-    return pd.read_parquet(config.CPU_RESULT)
+    try:
+        return pd.read_parquet(config.CPU_RESULT)
+    except Exception:
+        return pd.DataFrame()
 
-
-@st.cache_data(ttl=300)
 def load_gpu_results() -> dict:
-    path = str(config.GPU_RESULT) + ".npz"
-    if not os.path.exists(path):
-        path = config.GPU_RESULT  # sin extensión
-    if not os.path.exists(path):
-        return {}
-    data = np.load(path, allow_pickle=True)
-    return {k: data[k] for k in data.files}
+    for path in [config.GPU_RESULT + ".npz", config.GPU_RESULT]:
+        if os.path.exists(path):
+            try:
+                data = np.load(path, allow_pickle=True)
+                return {k: data[k] for k in data.files}
+            except Exception:
+                pass
+    return {}
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def render_sidebar(metrics: dict, gpu: dict) -> dict:
     st.sidebar.title("⚙️ Control del Pipeline")
+    running = _pipeline_is_running()
 
-    # Estado del pipeline
     st.sidebar.markdown("### Estado de Fases")
-    phase_status = {
-        "Fase 1 — Dask":         os.path.exists(config.PARQUET_DIR),
-        "Fase 2 — Multiproc":    os.path.exists(config.CPU_RESULT),
-        "Fase 3 — GPU/NumPy":    os.path.exists(config.GPU_RESULT) or
-                                  os.path.exists(config.GPU_RESULT + ".npz"),
-    }
-    for phase, done in phase_status.items():
-        icon = "✅" if done else "⏳"
-        st.sidebar.markdown(f"{icon} {phase}")
+    for label, exists in [
+        ("Fase 1 — Dask",      os.path.exists(config.PARQUET_DIR)),
+        ("Fase 2 — Multiproc", os.path.exists(config.CPU_RESULT)),
+        ("Fase 3 — GPU/NumPy", any(os.path.exists(p) for p in
+                                    [config.GPU_RESULT, config.GPU_RESULT + ".npz"])),
+    ]:
+        icon = "✅" if exists else ("⏳" if running else "❌")
+        st.sidebar.markdown(f"{icon} {label}")
 
-    # Botón para lanzar pipeline
     st.sidebar.markdown("---")
-    if st.sidebar.button("🚀 Ejecutar Pipeline Completo", use_container_width=True):
-        st.session_state["pipeline_running"] = True
-        st.session_state["pipeline_log"]     = []
+    if running:
+        st.sidebar.warning("⏳ Pipeline ejecutándose…")
+    else:
+        if st.sidebar.button("🚀 Ejecutar Pipeline",
+                             use_container_width=True, type="primary"):
+            _start_pipeline()
+            st.session_state["pipeline_launched"] = True
+            st.rerun()
 
-    # Filtros de análisis
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Filtros")
     filters = {}
-
     if metrics:
-        # Filtro de precio
-        price_opts = ["Todos", "low", "mid", "high"]
         filters["price_bucket"] = st.sidebar.selectbox(
-            "Bucket de Precio", price_opts, index=0
-        )
-
-        # Filtro de marca (top 20)
-        brand_rev = metrics.get("revenue_by_brand", {})
-        top_brands = ["Todas"] + list(brand_rev.keys())[:20]
-        filters["brand"] = st.sidebar.selectbox("Marca", top_brands, index=0)
-
+            "Bucket de Precio", ["Todos", "low", "mid", "high"])
+        top_brands = ["Todas"] + list(metrics.get("revenue_by_brand", {}).keys())[:20]
+        filters["brand"] = st.sidebar.selectbox("Marca", top_brands)
     if gpu:
-        # Filtro de segmento
-        n_seg = int(gpu.get("seg_count", np.array([5])).shape[0])
-        seg_options = ["Todos"] + [f"Segmento {i}" for i in range(n_seg)]
-        filters["segment"] = st.sidebar.selectbox("Segmento GPU", seg_options, index=0)
-
+        n_seg = int(gpu.get("seg_count", np.zeros(5)).shape[0])
+        filters["segment"] = st.sidebar.selectbox(
+            "Segmento GPU", ["Todos"] + [f"Segmento {i}" for i in range(n_seg)])
     return filters
 
 
-# ── KPI Cards ────────────────────────────────────────────────────────────────
+# ── Panel de log ──────────────────────────────────────────────────────────────
+
+def render_log_panel() -> bool:
+    """
+    Dibuja el panel de log y barra de progreso.
+    Devuelve True si el pipeline está corriendo (para que main haga el rerun al final).
+    """
+    running   = _pipeline_is_running()
+    launched  = st.session_state.get("pipeline_launched", False)
+
+    # Mostrar panel solo si fue lanzado alguna vez
+    if not launched and not os.path.exists(PIPELINE_LOG_FILE):
+        return False
+
+    pct = _log_pct()
+
+    st.markdown("---")
+    st.markdown("## 🚀 Ejecución del Pipeline")
+
+    col_prog, col_status = st.columns([4, 1])
+    with col_prog:
+        if running:
+            st.progress(pct / 100,
+                        text=f"⏳ Progreso estimado: {pct}%  —  actualizando cada 2s…")
+        else:
+            st.progress(1.0, text="✅ Pipeline completado")
+
+    with col_status:
+        if running:
+            st.markdown("🟢 **En curso**")
+        else:
+            st.markdown("✔️ **Finalizado**")
+
+    # Log en tiempo real
+    log_content = _read_log_tail(60)
+    st.code(log_content, language="bash")
+
+    # Nota de ayuda mientras corre
+    if running:
+        st.caption("📋 Las líneas más recientes aparecen abajo del recuadro. "
+                   "La página se refresca sola cada 2 segundos.")
+
+    return running
+
+
+# ── Visualizaciones ───────────────────────────────────────────────────────────
 
 def render_kpis(metrics: dict):
     st.markdown("## 📊 KPIs Globales")
+    rev   = metrics.get("total_revenue", 0)
+    users = metrics.get("unique_users", 0)
     c1, c2, c3, c4, c5 = st.columns(5)
-    total_events  = metrics.get("total_events", 0)
-    total_revenue = metrics.get("total_revenue", 0)
-    unique_users  = metrics.get("unique_users", 0)
-    unique_prods  = metrics.get("unique_products", 0)
-    avg_ticket    = total_revenue / unique_users if unique_users else 0
+    c1.metric("Total Eventos",    f"{metrics.get('total_events', 0):,}")
+    c2.metric("Revenue Total",    f"${rev:,.0f}")
+    c3.metric("Usuarios Únicos",  f"{users:,}")
+    c4.metric("Productos Únicos", f"{metrics.get('unique_products', 0):,}")
+    c5.metric("Ticket Promedio",  f"${rev/users:,.2f}" if users else "$0")
 
-    c1.metric("Total Eventos",    f"{total_events:,}")
-    c2.metric("Revenue Total",    f"${total_revenue:,.0f}")
-    c3.metric("Usuarios Únicos",  f"{unique_users:,}")
-    c4.metric("Productos Únicos", f"{unique_prods:,}")
-    c5.metric("Ticket Promedio",  f"${avg_ticket:,.2f}")
-
-
-# ── Revenue por Marca ─────────────────────────────────────────────────────────
-
-def render_brand_revenue(metrics: dict, filters: dict):
-    st.markdown("## 🏷️ Revenue por Marca (Top 30)")
+def render_brand_revenue(metrics: dict):
     brand_rev = metrics.get("revenue_by_brand", {})
     if not brand_rev:
-        st.info("Sin datos de Fase 1. Ejecuta el pipeline primero.")
         return
-
-    df = pd.DataFrame({"brand": list(brand_rev.keys()),
-                        "revenue": list(brand_rev.values())})
-    df = df.sort_values("revenue", ascending=True).tail(30)
-
+    df = (pd.DataFrame({"brand": list(brand_rev.keys()),
+                         "revenue": list(brand_rev.values())})
+            .sort_values("revenue", ascending=True).tail(30))
     fig = px.bar(df, x="revenue", y="brand", orientation="h",
                  color="revenue", color_continuous_scale="Viridis",
+                 title="Revenue por Marca (Top 30)",
                  labels={"revenue": "Revenue (USD)", "brand": "Marca"})
     fig.update_layout(height=500, coloraxis_showscale=False,
-                      margin=dict(l=120, r=20, t=30, b=40))
+                      margin=dict(l=120, r=20, t=40, b=40))
     st.plotly_chart(fig, use_container_width=True)
-
-
-# ── Distribución Horaria ──────────────────────────────────────────────────────
 
 def render_hourly(metrics: dict):
     hourly = metrics.get("hourly_stats", [])
     if not hourly:
         return
-
-    df = pd.DataFrame(hourly)
-    df.columns = [c if c != "count" else "transacciones" for c in df.columns]
-
+    df  = pd.DataFrame(hourly)
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(x=df["hour"], y=df["transacciones"],
-                         name="Transacciones", marker_color="#636EFA",
-                         opacity=0.6), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df["hour"], y=df["mean"],
-                             name="Ticket Promedio (USD)", mode="lines+markers",
-                             line=dict(color="#EF553B", width=2)),
-                  secondary_y=True)
+    fig.add_trace(go.Bar(x=df["hour"], y=df["count"], name="Transacciones",
+                         marker_color="#636EFA", opacity=0.6), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df["hour"], y=df["mean"], name="Ticket Medio (USD)",
+                             mode="lines+markers",
+                             line=dict(color="#EF553B", width=2)), secondary_y=True)
     fig.update_layout(title="Distribución Horaria de Compras",
-                      xaxis_title="Hora del Día (UTC)",
-                      height=350, legend=dict(x=0.01, y=0.99))
+                      xaxis_title="Hora (UTC)", height=350,
+                      legend=dict(x=0.01, y=0.99))
     fig.update_yaxes(title_text="Transacciones",   secondary_y=False)
     fig.update_yaxes(title_text="Ticket Promedio", secondary_y=True)
     st.plotly_chart(fig, use_container_width=True)
-
-
-# ── Revenue Mensual ───────────────────────────────────────────────────────────
 
 def render_monthly(metrics: dict):
     monthly = metrics.get("monthly_stats", [])
     if not monthly:
         return
-
     df = pd.DataFrame(monthly)
-    df["periodo"] = df["year"].astype(str) + "-" + df["month"].astype(str).str.zfill(2)
-
-    col1, col2 = st.columns(2)
-    with col1:
+    df["periodo"] = (df["year"].astype(str) + "-"
+                     + df["month"].astype(str).str.zfill(2))
+    c1, c2 = st.columns(2)
+    with c1:
         fig = px.line(df, x="periodo", y="sum", markers=True,
                       title="Revenue Mensual Total",
                       labels={"sum": "Revenue (USD)", "periodo": "Período"})
         fig.update_traces(line_color="#00CC96", line_width=2)
         st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        fig = px.bar(df, x="periodo", y="count",
-                     title="Transacciones por Mes",
-                     labels={"count": "Transacciones", "periodo": "Período"},
+    with c2:
+        fig = px.bar(df, x="periodo", y="count", title="Transacciones por Mes",
                      color="count", color_continuous_scale="Blues")
         fig.update_layout(coloraxis_showscale=False)
         st.plotly_chart(fig, use_container_width=True)
 
-
-# ── Segmentación GPU ──────────────────────────────────────────────────────────
-
 def render_segmentation(features_df: pd.DataFrame, gpu: dict, filters: dict):
     st.markdown("## 🤖 Segmentación de Usuarios (GPU / CUDA)")
-
     if features_df.empty or not gpu:
-        st.info("Sin resultados de Fase 2/3. Ejecuta el pipeline primero.")
+        st.info("Sin resultados de Fase 2/3.")
         return
-
     seg_ids = gpu.get("seg_ids", np.array([]))
     if len(seg_ids) == 0:
         return
-
-    NUMERIC_FEATURES = [
-        "frequency", "total_spend", "avg_price", "std_price",
-        "entropy_cat", "brand_loyalty", "weekend_ratio", "peak_hour",
-    ]
-
-    # PCA 2D para visualización
-    feat_cols = [c for c in NUMERIC_FEATURES if c in features_df.columns]
-    sample_size = min(len(seg_ids), len(features_df))
-    sub_df = features_df[feat_cols].iloc[:sample_size].fillna(0)
-
-    pca = PCA(n_components=2)
-    coords = pca.fit_transform(sub_df.values)
-
-    plot_df = pd.DataFrame({
-        "PC1":      coords[:, 0],
-        "PC2":      coords[:, 1],
-        "Segmento": [f"Seg {s}" for s in seg_ids[:sample_size]],
-        "frequency":    sub_df["frequency"].values if "frequency" in sub_df else 0,
-        "total_spend":  sub_df["total_spend"].values if "total_spend" in sub_df else 0,
+    FEATS     = ["frequency","total_spend","avg_price","std_price",
+                 "entropy_cat","brand_loyalty","weekend_ratio","peak_hour"]
+    feat_cols = [c for c in FEATS if c in features_df.columns]
+    n         = min(len(seg_ids), len(features_df))
+    sub_df    = features_df[feat_cols].iloc[:n].fillna(0)
+    pca       = PCA(n_components=2)
+    coords    = pca.fit_transform(sub_df.values)
+    plot_df   = pd.DataFrame({
+        "PC1": coords[:, 0], "PC2": coords[:, 1],
+        "Segmento":    [f"Seg {s}" for s in seg_ids[:n]],
+        "frequency":   sub_df["frequency"].values,
+        "total_spend": sub_df["total_spend"].values,
     })
-
-    # Filtro por segmento
     seg_filter = filters.get("segment", "Todos")
     if seg_filter != "Todos":
-        seg_num = int(seg_filter.split()[-1])
-        plot_df = plot_df[plot_df["Segmento"] == f"Seg {seg_num}"]
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        fig = px.scatter(
-            plot_df, x="PC1", y="PC2", color="Segmento",
-            size="frequency", hover_data=["total_spend"],
-            color_discrete_sequence=SEG_COLORS,
-            title="Mapa de Segmentos de Usuarios (PCA 2D)",
-            labels={"PC1": f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)",
-                    "PC2": f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)"},
-        )
+        plot_df = plot_df[plot_df["Segmento"] == f"Seg {seg_filter.split()[-1]}"]
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        fig = px.scatter(plot_df, x="PC1", y="PC2", color="Segmento",
+                         size="frequency", hover_data=["total_spend"],
+                         color_discrete_sequence=SEG_COLORS,
+                         title="Mapa de Segmentos de Usuarios (PCA 2D)",
+                         labels={
+                             "PC1": f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)",
+                             "PC2": f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)",
+                         })
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        # Radar de estadísticas por segmento
-        seg_mean  = gpu.get("seg_mean",  None)
-        feat_names = list(gpu.get("feature_names", np.array(NUMERIC_FEATURES)))
+    with c2:
+        seg_mean   = gpu.get("seg_mean")
+        feat_names = list(gpu.get("feature_names", np.array(FEATS)))
         if seg_mean is not None:
-            n_seg = seg_mean.shape[0]
             fig_r = go.Figure()
-            for s in range(n_seg):
+            for s in range(seg_mean.shape[0]):
                 vals = list(seg_mean[s]) + [seg_mean[s][0]]
                 cats = feat_names + [feat_names[0]]
                 fig_r.add_trace(go.Scatterpolar(
                     r=vals, theta=cats, fill="toself",
-                    name=f"Seg {s}", line_color=SEG_COLORS[s % len(SEG_COLORS)],
-                    opacity=0.7,
-                ))
+                    name=f"Seg {s}", line_color=SEG_COLORS[s % 5], opacity=0.7))
             fig_r.update_layout(
                 polar=dict(radialaxis=dict(visible=True)),
-                title="Perfil de Segmentos (Normalizado)",
-                height=400, showlegend=True,
-            )
+                title="Perfil de Segmentos (Normalizado)", height=400)
             st.plotly_chart(fig_r, use_container_width=True)
-
-
-# ── Heatmap de Similitud ──────────────────────────────────────────────────────
 
 def render_similarity_heatmap(gpu: dict):
     st.markdown("## 🔥 Matriz de Similitud Coseno (GPU)")
-
-    sim = gpu.get("sim_matrix", None)
+    sim = gpu.get("sim_matrix")
     if sim is None:
-        st.info("Sin resultados de Fase 3. Ejecuta el pipeline primero.")
+        st.info("Sin resultados de Fase 3.")
         return
-
-    # Mostrar submatriz (max 100×100 para rendimiento del navegador)
-    n = min(100, sim.shape[0])
-    sub = sim[:n, :n]
-
-    fig = px.imshow(
-        sub, color_continuous_scale="RdBu_r",
-        zmin=-1, zmax=1,
-        title=f"Similitud Coseno entre usuarios (primeros {n}×{n})",
-        labels={"color": "Similitud"},
-    )
+    n   = min(100, sim.shape[0])
+    fig = px.imshow(sim[:n, :n], color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                    title=f"Similitud Coseno — primeros {n}×{n} usuarios",
+                    labels={"color": "Similitud"})
     fig.update_layout(height=450)
     st.plotly_chart(fig, use_container_width=True)
-
     gpu_mode = bool(int(gpu.get("gpu_mode", np.array([0]))[0]))
-    st.caption(
-        f"⚡ Calculado en {'**GPU (CUDA)**' if gpu_mode else '**CPU (NumPy fallback)**'}. "
-        f"Dimensión completa: {sim.shape[0]}×{sim.shape[0]}"
-    )
-
-
-# ── Features por Segmento (filtro en tiempo real) ────────────────────────────
+    st.caption(f"⚡ Modo: {'**GPU CUDA**' if gpu_mode else '**CPU NumPy fallback**'} · "
+               f"Dimensión completa: {sim.shape[0]}×{sim.shape[0]}")
 
 def render_feature_filter(features_df: pd.DataFrame, gpu: dict, filters: dict):
-    st.markdown("## 🔍 Análisis de Features por Segmento (Tiempo Real)")
-
+    st.markdown("## 🔍 Análisis de Features por Segmento")
     if features_df.empty or not gpu:
         return
-
     seg_ids = gpu.get("seg_ids", np.array([]))
     if len(seg_ids) == 0:
         return
-
-    NUMERIC_FEATURES = [
-        "frequency", "total_spend", "avg_price", "std_price",
-        "entropy_cat", "brand_loyalty", "weekend_ratio", "peak_hour",
-    ]
-
-    n_users = min(len(seg_ids), len(features_df))
-    df = features_df.iloc[:n_users].copy()
-    df["segmento"] = [f"Seg {s}" for s in seg_ids[:n_users]]
-
-    # Filtro por segmento (tiempo real con Streamlit)
+    FEATS     = ["frequency","total_spend","avg_price","std_price",
+                 "entropy_cat","brand_loyalty","weekend_ratio","peak_hour"]
+    n         = min(len(seg_ids), len(features_df))
+    df        = features_df.iloc[:n].copy()
+    df["segmento"] = [f"Seg {s}" for s in seg_ids[:n]]
     seg_filter = filters.get("segment", "Todos")
     if seg_filter != "Todos":
-        seg_num = int(seg_filter.split()[-1])
-        df = df[df["segmento"] == f"Seg {seg_num}"]
-
-    # Selector de feature a analizar
-    feat_cols = [c for c in NUMERIC_FEATURES if c in df.columns]
+        df = df[df["segmento"] == f"Seg {seg_filter.split()[-1]}"]
+    feat_cols     = [c for c in FEATS if c in df.columns]
     selected_feat = st.selectbox("Feature a visualizar", feat_cols, index=1)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = px.box(df, x="segmento", y=selected_feat,
-                     color="segmento", color_discrete_sequence=SEG_COLORS,
-                     title=f"Distribución de '{selected_feat}' por Segmento",
-                     points=False)
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.box(df, x="segmento", y=selected_feat, color="segmento",
+                     color_discrete_sequence=SEG_COLORS,
+                     title=f"Distribución de '{selected_feat}'", points=False)
         fig.update_layout(showlegend=False, height=350)
         st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
+    with c2:
         fig = px.histogram(df, x=selected_feat, color="segmento",
                            color_discrete_sequence=SEG_COLORS,
-                           nbins=40, barmode="overlay",
-                           title=f"Histograma de '{selected_feat}'",
-                           opacity=0.65)
+                           nbins=40, barmode="overlay", opacity=0.65,
+                           title=f"Histograma de '{selected_feat}'")
         fig.update_layout(height=350)
         st.plotly_chart(fig, use_container_width=True)
-
-    # Tabla de estadísticas por segmento
-    with st.expander("📋 Tabla de estadísticas"):
-        stats = (
-            df.groupby("segmento")[feat_cols]
-            .agg(["mean", "std", "min", "max", "count"])
-            .round(3)
-        )
+    with st.expander("📋 Tabla de estadísticas por segmento"):
+        stats = (df.groupby("segmento")[feat_cols]
+                   .agg(["mean","std","min","max","count"])
+                   .round(3))
         st.dataframe(stats, use_container_width=True)
-
-
-# ── Ejecutor de Pipeline Asíncrono ────────────────────────────────────────────
-
-def render_pipeline_runner():
-    if not st.session_state.get("pipeline_running"):
-        return
-
-    st.markdown("---")
-    st.markdown("## 🚀 Ejecutando Pipeline")
-    log_container = st.empty()
-    progress      = st.progress(0, text="Iniciando…")
-
-    def run_pipeline():
-        """Hilo separado que ejecuta pipeline_runner.py como subproceso."""
-        runner = os.path.join(str(ROOT), "pipeline_runner.py")
-        proc   = subprocess.Popen(
-            [sys.executable, runner],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        logs = []
-        phase_keywords = {
-            "FASE 1": 25, "FASE 2": 50, "FASE 3": 75, "FASE 4": 95
-        }
-        for line in proc.stdout:
-            line = line.rstrip()
-            logs.append(line)
-            st.session_state["pipeline_log"] = logs.copy()
-            for kw, pct in phase_keywords.items():
-                if kw in line:
-                    st.session_state["pipeline_pct"] = pct
-        proc.wait()
-        st.session_state["pipeline_running"] = False
-        st.session_state["pipeline_pct"]     = 100
-
-    if "pipeline_thread" not in st.session_state or \
-            not st.session_state["pipeline_thread"].is_alive():
-        t = threading.Thread(target=run_pipeline, daemon=True)
-        t.start()
-        st.session_state["pipeline_thread"] = t
-
-    # Actualizar log en tiempo real
-    logs = st.session_state.get("pipeline_log", [])
-    pct  = st.session_state.get("pipeline_pct", 5)
-    progress.progress(pct / 100, text=f"Progreso: {pct}%")
-    log_container.text_area("Log del Pipeline", "\n".join(logs[-40:]),
-                             height=300, label_visibility="collapsed")
-
-    time.sleep(1)
-    st.rerun()
 
 
 # ── App Principal ─────────────────────────────────────────────────────────────
 
 def main():
+    if "pipeline_launched" not in st.session_state:
+        st.session_state["pipeline_launched"] = False
+
     st.title(f"🛒 {config.APP_TITLE}")
-    st.markdown(
-        "Pipeline de análisis híbrido **CPU (Dask + Multiprocessing) → GPU (CUDA)**  "
-        "sobre datos de comportamiento de e-commerce (~9 GB)."
-    )
+    st.caption("Pipeline híbrido: Dask → Multiprocessing → GPU (CUDA) → Dashboard")
 
-    # Inicializar session_state
-    if "pipeline_running" not in st.session_state:
-        st.session_state["pipeline_running"] = False
-    if "pipeline_log" not in st.session_state:
-        st.session_state["pipeline_log"] = []
-    if "pipeline_pct" not in st.session_state:
-        st.session_state["pipeline_pct"] = 0
-
-    # Cargar datos
+    # Cargar datos del disco
     metrics     = load_metrics()
     features_df = load_user_features()
     gpu         = load_gpu_results()
@@ -463,44 +399,46 @@ def main():
     # Sidebar
     filters = render_sidebar(metrics, gpu)
 
-    # Pipeline runner (si está activo)
-    render_pipeline_runner()
+    # ── Panel de log: se dibuja PRIMERO, devuelve si sigue corriendo ──────────
+    pipeline_running = render_log_panel()
 
-    # Contenido principal
+    # ── Dashboard de resultados ───────────────────────────────────────────────
     if not metrics and not gpu:
-        st.warning(
-            "⚠️ No se encontraron resultados previos. "
-            "Usa el botón **🚀 Ejecutar Pipeline Completo** en la barra lateral, "
-            "o ejecuta `python pipeline_runner.py` en la terminal."
+        if not pipeline_running:
+            st.info("⚠️ Sin resultados aún. Presiona **🚀 Ejecutar Pipeline** "
+                    "en la barra lateral.")
+    else:
+        if metrics:
+            st.markdown("---")
+            render_kpis(metrics)
+            st.markdown("---")
+            c1, c2 = st.columns(2)
+            with c1: render_brand_revenue(metrics)
+            with c2: render_hourly(metrics)
+            st.markdown("---")
+            render_monthly(metrics)
+            st.markdown("---")
+
+        render_segmentation(features_df, gpu, filters)
+        st.markdown("---")
+        render_similarity_heatmap(gpu)
+        st.markdown("---")
+        render_feature_filter(features_df, gpu, filters)
+
+        st.markdown("---")
+        gpu_mode = bool(int(gpu.get("gpu_mode", np.array([0]))[0])) if gpu else False
+        st.caption(
+            f"Dataset: [Kaggle E-Commerce Behavior](https://www.kaggle.com/datasets/"
+            f"mkechinov/ecommerce-behavior-data-from-multi-category-store) · "
+            f"GPU: {'✅ CUDA activo' if gpu_mode else '⚠️ NumPy fallback'}"
         )
-        return
 
-    if metrics:
-        render_kpis(metrics)
-        st.markdown("---")
-        col_left, col_right = st.columns(2)
-        with col_left:
-            render_brand_revenue(metrics, filters)
-        with col_right:
-            render_hourly(metrics)
-        st.markdown("---")
-        render_monthly(metrics)
-        st.markdown("---")
-
-    render_segmentation(features_df, gpu, filters)
-    st.markdown("---")
-    render_similarity_heatmap(gpu)
-    st.markdown("---")
-    render_feature_filter(features_df, gpu, filters)
-
-    # Footer
-    st.markdown("---")
-    gpu_mode = bool(int(gpu.get("gpu_mode", np.array([0]))[0])) if gpu else False
-    st.caption(
-        f"Dataset: [E-Commerce Behavior Data](https://www.kaggle.com/datasets/"
-        f"mkechinov/ecommerce-behavior-data-from-multi-category-store) · "
-        f"GPU: {'✅ CUDA activo' if gpu_mode else '⚠️ NumPy fallback'}"
-    )
+    # ── Auto-refresh AL FINAL, después de renderizar todo ────────────────────
+    # Así Streamlit muestra el log y las gráficas actuales ANTES de dormir.
+    # Al despertar hace rerun → el script corre de nuevo desde arriba con datos frescos.
+    if pipeline_running:
+        time.sleep(2)
+        st.rerun()
 
 
 if __name__ == "__main__":
